@@ -1,13 +1,25 @@
 # process_data.py
+import sys
+import io
 import pandas as pd
 import numpy as np
 import glob
 import os
 from scipy.interpolate import interp1d
+import requests
+from datetime import datetime
+
+# 强制标准输出使用 UTF-8 编码（解决 Windows 控制台打印 emoji 的问题）
+if sys.stdout.encoding != 'utf-8':
+    sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8')
 
 DRY_END = 150
 MAILLARD_END = 530
 DEV_END = 800
+
+# 烘焙厂坐标（请根据实际情况修改）
+LAT = 52.4591659   # 阿姆斯特丹纬度，如果是其他城市请修改
+LON = 4.595659    # 阿姆斯特丹经度
 
 def find_sheet_by_keywords(xls, keywords):
     for sheet in xls.sheet_names:
@@ -21,7 +33,6 @@ def extract_start_gas(df_gas):
     df_gas['gascontrol'] = pd.to_numeric(df_gas['gascontrol'], errors='coerce')
     df_gas = df_gas.dropna(subset=['gascontrol'])
 
-    # 方法1：入豆前最后5秒众数
     pre = df_gas[df_gas['time'] < 0]
     if len(pre) > 0:
         last_time = pre['time'].max()
@@ -34,7 +45,6 @@ def extract_start_gas(df_gas):
             mode_val = unique[np.argmax(counts)]
             return int(round(mode_val))
 
-    # 方法2：入豆后第一个非零燃气值
     post = df_gas[df_gas['time'] >= 0]
     if len(post) > 0:
         non_zero = post[post['gascontrol'] != 0]
@@ -43,6 +53,30 @@ def extract_start_gas(df_gas):
             return int(round(first_val))
 
     return np.nan
+
+def get_weather(date_str):
+    """根据日期（YYYY-MM-DD）获取当天平均温度和湿度"""
+    try:
+        url = "https://archive-api.open-meteo.com/v1/archive"
+        params = {
+            "latitude": LAT,
+            "longitude": LON,
+            "start_date": date_str,
+            "end_date": date_str,
+            "daily": ["temperature_2m_mean", "relative_humidity_2m_mean"],
+            "timezone": "Europe/Amsterdam"
+        }
+        resp = requests.get(url, params=params, timeout=10)
+        if resp.status_code == 200:
+            data = resp.json()
+            temp = data["daily"]["temperature_2m_mean"][0]
+            hum = data["daily"]["relative_humidity_2m_mean"][0]
+            return temp, hum
+        else:
+            return np.nan, np.nan
+    except Exception as e:
+        print(f"  ⚠️ 获取天气失败: {e}")
+        return np.nan, np.nan
 
 def load_roast_data(file_path):
     try:
@@ -72,7 +106,7 @@ def load_roast_data(file_path):
 
         if df_gas is not None:
             merged = pd.merge(df_bean, df_gas, on='time', how='outer').sort_values('time')
-            merged['gascontrol'] = merged['gascontrol'].fillna(method='ffill').fillna(0)
+            merged['gascontrol'] = merged['gascontrol'].ffill().fillna(0)
         else:
             merged = df_bean.copy()
             merged['gascontrol'] = 0
@@ -150,6 +184,7 @@ def main():
     ref_summary['deviation'] = 0.0
     ref_summary['start_gas'] = ref_df.attrs.get('start_gas', np.nan)
     pd.DataFrame([ref_summary]).to_csv('ref_summary.csv', index=False)
+    print("✅ 基准汇总已保存到 ref_summary.csv")
 
     roast_files = glob.glob('roasts/*.xls*')
     if not roast_files:
@@ -177,6 +212,39 @@ def main():
         summary['batch_id'] = fname
         summary['deviation'] = compute_deviation(batch_df, ref_df)
         summary['start_gas'] = batch_df.attrs.get('start_gas', np.nan)
+
+        # 添加日期和天气
+        try:
+            df_gen = pd.read_excel(f, sheet_name='General')
+            date_col = None
+            for col in df_gen.columns:
+                if 'date' in col.lower():
+                    date_col = col
+                    break
+            if date_col is None and len(df_gen.columns) > 0:
+                date_col = df_gen.columns[0]
+            if date_col:
+                first_valid = df_gen[date_col].dropna().iloc[0] if not df_gen[date_col].dropna().empty else None
+                if first_valid is not None:
+                    if isinstance(first_valid, str):
+                        date_str = first_valid.split(',')[0].strip()
+                    else:
+                        date_str = pd.to_datetime(first_valid).date().isoformat()
+                    # 获取天气
+                    temp, hum = get_weather(date_str)
+                    summary['avg_temp'] = temp
+                    summary['avg_humidity'] = hum
+                else:
+                    summary['avg_temp'] = np.nan
+                    summary['avg_humidity'] = np.nan
+            else:
+                summary['avg_temp'] = np.nan
+                summary['avg_humidity'] = np.nan
+        except Exception as e:
+            print(f"  ⚠️ 无法读取日期或天气: {e}")
+            summary['avg_temp'] = np.nan
+            summary['avg_humidity'] = np.nan
+
         all_summaries.append(summary)
         success_count += 1
         print(f"  ✅ 成功处理 {fname}，起始燃气 = {summary['start_gas']:.1f}%")

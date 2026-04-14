@@ -4,7 +4,12 @@ import pandas as pd
 import numpy as np
 import plotly.graph_objects as go
 import plotly.io as pio
+import scipy.stats as stats
 from scipy.interpolate import interp1d
+import os
+import sys
+import subprocess
+import glob
 
 st.set_page_config(page_title="Paz Roast MVP", layout="wide")
 st.title("☕️ Paz Coffee Energy Efficiency Monitoring System")
@@ -30,7 +35,7 @@ master_sum = master_sum.copy()
 master_sum['start_gas_num'] = pd.to_numeric(master_sum['start_gas'], errors='coerce')
 master_sum['start_gas_int'] = master_sum['start_gas_num'].round(0).astype('Int64')
 
-# 侧边栏显示批次数量统计（已删除调试信息行）
+# 侧边栏显示批次数量统计
 available_gas = master_sum['start_gas_int'].dropna().unique()
 available_gas = sorted(available_gas)
 
@@ -39,6 +44,131 @@ if available_gas:
     for g in available_gas:
         cnt = (master_sum['start_gas_int'] == g).sum()
         st.sidebar.write(f"  {g}%: {cnt} batches")
+
+# ========== 文件上传与手动刷新功能 ==========
+st.sidebar.markdown("---")
+col1, col2 = st.sidebar.columns([4, 1])
+with col1:
+    st.markdown("## 📤 Import New Roast")
+with col2:
+    # 刷新按钮（仅图标）
+    if st.button("🔄", help="Manually refresh data (re-run process_data.py)"):
+        with st.spinner("Processing data, please wait..."):
+            result = subprocess.run(
+                [sys.executable, "process_data.py"],
+                cwd=os.path.dirname(os.path.abspath(__file__)),
+                capture_output=True,
+                text=True
+            )
+            if result.returncode == 0:
+                st.sidebar.success("✅ Data refreshed! Reloading...")
+                st.cache_data.clear()
+                st.rerun()
+            else:
+                st.sidebar.error("❌ Refresh failed.")
+                st.sidebar.code(result.stderr)
+
+# 多文件上传器
+uploaded_files = st.sidebar.file_uploader(
+    "Select Excel files (.xls or .xlsx)",
+    type=["xls", "xlsx"],
+    accept_multiple_files=True,
+    help="Select one or more Cropster export files. Then click 'Upload Selected Files'."
+)
+
+if st.sidebar.button("📤 Upload Selected Files"):
+    if not uploaded_files:
+        st.sidebar.warning("No files selected.")
+    else:
+        with st.spinner(f"Saving {len(uploaded_files)} file(s) and processing data..."):
+            for uploaded_file in uploaded_files:
+                save_path = os.path.join("roasts", uploaded_file.name)
+                with open(save_path, "wb") as f:
+                    f.write(uploaded_file.getbuffer())
+            st.sidebar.success(f"✅ Saved {len(uploaded_files)} file(s).")
+            # 运行数据处理
+            result = subprocess.run(
+                [sys.executable, "process_data.py"],
+                cwd=os.path.dirname(os.path.abspath(__file__)),
+                capture_output=True,
+                text=True
+            )
+            if result.returncode == 0:
+                st.sidebar.success("✅ Data processing completed! Refreshing...")
+                st.cache_data.clear()
+                st.rerun()
+            else:
+                st.sidebar.error("❌ Processing failed.")
+                st.sidebar.code(result.stderr)
+
+# ========== 删除批次功能 ==========
+st.sidebar.markdown("---")
+st.sidebar.markdown("## 🗑️ Delete a Roast Batch")
+
+all_batch_ids = master_sum['batch_id'].tolist()
+selected_delete = st.sidebar.selectbox("Select batch to delete:", all_batch_ids)
+
+if st.sidebar.button("Delete Selected Batch"):
+    # 精确匹配文件名
+    file_path = os.path.join("roasts", selected_delete)
+    if os.path.exists(file_path):
+        os.remove(file_path)
+        st.sidebar.success(f"✅ Deleted file: {selected_delete}")
+    else:
+        matched = glob.glob(os.path.join("roasts", f"*{selected_delete}*"))
+        if matched:
+            os.remove(matched[0])
+            st.sidebar.success(f"✅ Deleted file: {os.path.basename(matched[0])}")
+        else:
+            st.sidebar.error(f"❌ File not found for {selected_delete}")
+
+    with st.spinner("Updating data..."):
+        result = subprocess.run(
+            [sys.executable, "process_data.py"],
+            cwd=os.path.dirname(os.path.abspath(__file__)),
+            capture_output=True,
+            text=True
+        )
+        if result.returncode == 0:
+            st.sidebar.success("✅ Data updated. Refreshing...")
+            st.cache_data.clear()
+            st.rerun()
+        else:
+            st.sidebar.error("❌ Update failed.")
+            st.sidebar.code(result.stderr)
+
+# ========== 天气推荐模块 ==========
+st.sidebar.markdown("---")
+st.sidebar.markdown("## 🌦️ Weather‑Based Recommendation")
+today_humidity = st.sidebar.number_input(
+    "Today's humidity (%)",
+    min_value=0.0, max_value=100.0,
+    value=70.0, step=1.0,
+    help="Enter the average humidity for today to get a recommended start gas."
+)
+
+if st.sidebar.button("Get Recommended Start Gas"):
+    good_batches = master_sum[
+        (master_sum['deviation'] < master_sum['deviation'].quantile(0.3)) &
+        (master_sum['avg_humidity'].notna())
+        ]
+    if len(good_batches) >= 10:
+        slope, intercept, r_value, p_value, std_err = stats.linregress(
+            good_batches['avg_humidity'],
+            good_batches['start_gas_num']
+        )
+        recommended = intercept + slope * today_humidity
+        recommended = max(20, min(100, recommended))
+        st.sidebar.success(f"✅ Recommended start gas: **{recommended:.1f}%**")
+        st.sidebar.caption(
+            f"Based on {len(good_batches)} high‑quality batches. Sensitivity: {slope:.2f}% per 1% humidity."
+        )
+        st.session_state['humidity_slope'] = slope
+        st.session_state['humidity_intercept'] = intercept
+    else:
+        st.sidebar.warning(
+            f"Only {len(good_batches)} batches with weather data. Need at least 10 for reliable recommendation."
+        )
 
 # 视图选择
 view = st.sidebar.radio("Select View", ["Single Batch Comparison", "Statistical Analysis by Start Gas"])
@@ -50,7 +180,7 @@ if view == "Single Batch Comparison":
     current_sum = master_sum[master_sum['batch_id'] == selected].iloc[0]
     current_ts = master_ts[master_ts['batch_id'] == selected].sort_values('time_sec')
 
-    col_left, col_right = st.columns([2,1])
+    col_left, col_right = st.columns([2, 1])
     with col_left:
         st.subheader("Temperature Curve Comparison")
         fig = go.Figure()
@@ -137,10 +267,10 @@ if view == "Single Batch Comparison":
         total_batches = len(master_sum)
 
         # 排名显示（带颜色和文字评级）
-        dev_rank = int(master_sum[master_sum['batch_id']==selected]['dev_rank'].iloc[0])
-        gas_rank = int(master_sum[master_sum['batch_id']==selected]['gas_rank'].iloc[0])
+        dev_rank = int(master_sum[master_sum['batch_id'] == selected]['dev_rank'].iloc[0])
+        gas_rank = int(master_sum[master_sum['batch_id'] == selected]['gas_rank'].iloc[0])
 
-        # 定义评级函数
+
         def get_rating(rank, total):
             if rank <= total * 0.3:
                 return "Excellent", "green"
@@ -148,6 +278,7 @@ if view == "Single Batch Comparison":
                 return "Average", "orange"
             else:
                 return "Poor", "red"
+
 
         dev_rating, dev_color = get_rating(dev_rank, total_batches)
         gas_rating, gas_color = get_rating(gas_rank, total_batches)
@@ -175,6 +306,29 @@ if view == "Single Batch Comparison":
             advice.append("✅ This batch is performing well in all aspects.")
         for a in advice:
             st.write(a)
+
+        # ----- 显示当天天气信息（如果存在）-----
+        if 'avg_humidity' in current_sum.index and pd.notna(current_sum['avg_humidity']):
+            st.markdown("### Weather on Roast Day")
+            st.write(f"💧 Humidity: {current_sum['avg_humidity']:.1f}%")
+            st.write(f"🌡️ Temperature: {current_sum['avg_temp']:.1f}°C")
+
+            # 湿度差异与调整建议
+            diff = today_humidity - current_sum['avg_humidity']
+            if abs(diff) > 5:
+                slope = st.session_state.get('humidity_slope', None)
+                if slope is not None:
+                    adjust_gas = slope * diff
+                    st.info(
+                        f"💡 Compared to this batch, today's humidity is **{diff:+.1f}%** different. "
+                        f"You may consider adjusting start gas by **{adjust_gas:+.1f}%** to compensate."
+                    )
+                else:
+                    st.info(
+                        f"💡 Compared to this batch, today's humidity is **{diff:+.1f}%** different. "
+                        "Use the 'Get Recommended Start Gas' button in the sidebar for a precise adjustment."
+                    )
+        # -----------------------------------------
 
         st.caption("*Lower energy deviation and lower curve deviation indicate better performance.*")
 
@@ -230,7 +384,6 @@ else:
             "Box plot: The box shows the middle 50% of batches (25th–75th percentile). "
             "The line inside is the median. Whiskers extend to min/max within 1.5× interquartile range."
         )
-        # 下载箱线图
         html_str = pio.to_html(fig, include_plotlyjs='cdn')
         st.download_button(
             label="📥 Download Gas Box Plot",
@@ -280,11 +433,11 @@ else:
             name=f'{selected_gas}% Average', line=dict(color='blue')
         ))
         fig.add_trace(go.Scatter(
-            x=time_uniform, y=mean_c+std_c,
+            x=time_uniform, y=mean_c + std_c,
             mode='lines', line=dict(width=0), showlegend=False
         ))
         fig.add_trace(go.Scatter(
-            x=time_uniform, y=mean_c-std_c,
+            x=time_uniform, y=mean_c - std_c,
             mode='lines', line=dict(width=0), fill='tonexty',
             fillcolor='rgba(0,0,255,0.2)', name='±1 Std Dev'
         ))
@@ -336,5 +489,70 @@ else:
         mime="text/html",
         key="download_scatter"
     )
+
+    # ----- 湿度 vs 总燃气散点图 + 回归线 + 推荐调整 -----
+    if 'avg_humidity' in group_df.columns and group_df['avg_humidity'].notna().any():
+        st.markdown("### Humidity vs Energy Consumption")
+        valid = group_df[['avg_humidity', 'total_gas']].dropna()
+        if len(valid) >= 2:
+            slope, intercept, r_value, p_value, std_err = stats.linregress(valid['avg_humidity'], valid['total_gas'])
+            x_min = valid['avg_humidity'].min()
+            x_max = valid['avg_humidity'].max()
+            x_line = [x_min, x_max]
+            y_line = [intercept + slope * x for x in x_line]
+
+            fig_hum = go.Figure()
+            fig_hum.add_trace(go.Scatter(
+                x=valid['avg_humidity'],
+                y=valid['total_gas'],
+                mode='markers',
+                text=group_df.loc[valid.index, 'batch_id'],
+                name=f'{selected_gas}% batches',
+                marker=dict(color='green', size=8)
+            ))
+            fig_hum.add_trace(go.Scatter(
+                x=x_line, y=y_line,
+                mode='lines',
+                name='Regression line',
+                line=dict(color='red', dash='dash')
+            ))
+            fig_hum.update_layout(
+                xaxis_title="Average Daily Humidity (%)",
+                yaxis_title="Total Gas Consumption",
+                hovermode='closest'
+            )
+            st.plotly_chart(fig_hum, use_container_width=True)
+
+            st.caption(f"Correlation coefficient: {r_value:.3f} (positive = higher humidity → more gas)")
+
+            mean_humidity = valid['avg_humidity'].mean()
+            mean_gas = valid['total_gas'].mean()
+            gas_change_per_1pct_humidity = slope / mean_gas * 100
+            typical_humidity_delta = 10
+            gas_change_per_10pct = gas_change_per_1pct_humidity * typical_humidity_delta
+
+            st.markdown("**Recommendation based on data:**")
+            st.write(
+                f"- For every 1% increase in humidity, total gas consumption changes by **{gas_change_per_1pct_humidity:.2f}%** on average.")
+            st.write(
+                f"- If humidity is 10% higher than your typical level (≈ {mean_humidity:.1f}%), you may need to adjust start gas by approximately **{gas_change_per_10pct:.1f}%** to compensate.")
+            st.write("- *Note: Start gas adjustment is a proxy; actual gas control during the roast also matters.*")
+        else:
+            st.warning("Not enough data points to compute regression line.")
+            fig_hum = go.Figure()
+            fig_hum.add_trace(go.Scatter(
+                x=group_df['avg_humidity'],
+                y=group_df['total_gas'],
+                mode='markers',
+                text=group_df['batch_id'],
+                name=f'{selected_gas}% batches',
+                marker=dict(color='green', size=8)
+            ))
+            fig_hum.update_layout(
+                xaxis_title="Average Daily Humidity (%)",
+                yaxis_title="Total Gas Consumption",
+                hovermode='closest'
+            )
+            st.plotly_chart(fig_hum, use_container_width=True)
 
     st.caption("*Lower energy consumption and lower curve deviation indicate better performance.*")
